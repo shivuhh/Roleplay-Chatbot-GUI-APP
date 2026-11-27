@@ -163,19 +163,62 @@ class ChatClient:
     def stream_reply(
         self,
         cancel: threading.Event,
+        previous_reply: Optional[str] = None,
+        continue_scene: bool = False,
     ) -> Iterator[StreamEvent]:
         self.trim_history()
 
         parts: list[str] = []
         stats: Optional[Stats] = None
         error: Optional[str] = None
+        messages = self._messages()
+        options: Optional[dict] = None
+
+        if previous_reply:
+            # Append request-only guidance so Ollama can reuse the cached
+            # conversation prefix instead of reprocessing the entire chat.
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Offer a fresh take on Matthew's response to the "
+                    "latest message. Explore a different reaction or "
+                    "direction while preserving established events and "
+                    "Matthew's personality. Let the response arise "
+                    "naturally from the current moment.\n\n"
+                    "Earlier response for reference:\n"
+                    f"{previous_reply}"
+                ),
+            })
+            options = {
+                "temperature": 0.85,
+                "repeat_last_n": 1024,
+            }
+
+        if continue_scene:
+            # Empty Send advances the scene without adding a fake user
+            # message or saving this request-only instruction.
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Continue naturally from Matthew's previous response "
+                    "and the established scene. Offer the next moment or "
+                    "thought while preserving his personality and the "
+                    "continuity of the conversation. Do not write the "
+                    "other person's words or actions."
+                ),
+            })
 
         try:
-            stream = self.client.chat(
-                model=self.settings.model,
-                messages=self._messages(),
-                stream=True,
-            )
+            request = {
+                "model": self.settings.model,
+                "messages": messages,
+                "stream": True,
+            }
+
+            if options is not None:
+                request["options"] = options
+
+            stream = self.client.chat(**request)
 
             for chunk in stream:
                 if cancel.is_set():
@@ -2641,6 +2684,9 @@ class ChatApp:
                 self.client.add_user(text)
                 self._write_user(text)
                 self._start_generation()
+            elif self.client.history:
+                self._apply_settings()
+                self._start_generation(continue_scene=True)
 
         return "break"
 
@@ -2654,15 +2700,20 @@ class ChatApp:
             )
             return
 
+        previous_reply = self.client.last_assistant_text()
+
         if self.client.pop_last_assistant():
             self._delete_last_assistant_view()
 
-        if (
-            self.client.history
-            and self.client.history[-1]["role"] == "user"
-        ):
-            self._apply_settings()
-            self._start_generation()
+        if self.client.history:
+            last_role = self.client.history[-1]["role"]
+
+            if last_role in ("user", "assistant"):
+                self._apply_settings()
+                self._start_generation(
+                    previous_reply,
+                    continue_scene=(last_role == "assistant"),
+                )
 
     def stop(self) -> None:
         self.cancel.set()
@@ -2763,7 +2814,11 @@ class ChatApp:
 
     # ---- generation ------------------------------------------------------
 
-    def _start_generation(self) -> None:
+    def _start_generation(
+        self,
+        previous_reply: Optional[str] = None,
+        continue_scene: bool = False,
+    ) -> None:
         self.cancel.clear()
         self.stream_failed = False
         self._set_busy(True)
@@ -2777,12 +2832,19 @@ class ChatApp:
 
         threading.Thread(
             target=self._worker,
+            args=(previous_reply, continue_scene),
             daemon=True,
         ).start()
 
-    def _worker(self) -> None:
+    def _worker(
+        self,
+        previous_reply: Optional[str] = None,
+        continue_scene: bool = False,
+    ) -> None:
         for event in self.client.stream_reply(
-            self.cancel
+            self.cancel,
+            previous_reply=previous_reply,
+            continue_scene=continue_scene,
         ):
             self.events.put(event)
 
